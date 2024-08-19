@@ -1,36 +1,94 @@
+#![allow(non_snake_case)]
 /// Actual ConPTY implementation.
-
-use windows::core::{PWSTR, PCWSTR, Error};
-use windows::Win32::Foundation::{
-    CloseHandle, HANDLE,
-    S_OK, INVALID_HANDLE_VALUE};
+use windows::core::{Error, HRESULT, HSTRING, PCSTR, PCWSTR, PWSTR};
+use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE, HWND, INVALID_HANDLE_VALUE, S_OK};
 use windows::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_GENERIC_READ, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, OPEN_EXISTING, FILE_GENERIC_WRITE,
-    FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES};
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAGS_AND_ATTRIBUTES, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+};
 use windows::Win32::System::Console::{
-    HPCON, AllocConsole, GetConsoleWindow,
-    GetConsoleMode, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-    SetConsoleMode, SetStdHandle, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE,
-    STD_INPUT_HANDLE, COORD, CreatePseudoConsole, ResizePseudoConsole,
-    ClosePseudoConsole, FreeConsole};
+    CONSOLE_MODE, COORD, ENABLE_VIRTUAL_TERMINAL_PROCESSING, HPCON, STD_ERROR_HANDLE, STD_HANDLE,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+};
+use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::Threading::{
-    PROCESS_INFORMATION, STARTUPINFOEXW, STARTUPINFOW,
-    LPPROC_THREAD_ATTRIBUTE_LIST, InitializeProcThreadAttributeList,
-    UpdateProcThreadAttribute, CreateProcessW,
-    EXTENDED_STARTUPINFO_PRESENT, CREATE_UNICODE_ENVIRONMENT,
-    DeleteProcThreadAttributeList};
+    CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
+    UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, STARTUPINFOEXW, STARTUPINFOW,
+};
 use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
-use windows::core::HRESULT;
 
-use std::{mem, ptr};
-use std::mem::MaybeUninit;
 use std::ffi::OsString;
+use std::mem::MaybeUninit;
 use std::os::windows::ffi::OsStrExt;
+use std::os::windows::prelude::*;
+use std::{mem, ptr};
 
-use crate::pty::{PTYProcess, PTYImpl};
 use crate::pty::PTYArgs;
+use crate::pty::{PTYImpl, PTYProcess};
+
+lazy_static::lazy_static! {
+    static ref CONSOLE_OPT: ConsoleOpt =  {
+        let kernal_32 = unsafe { GetModuleHandleW(&HSTRING::from("kernel32.dll")).unwrap()};
+        ConsoleOpt {
+            alloc_console : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("AllocConsole\0".as_ptr())))
+            },
+            create_pseudo_console : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("CreatePseudoConsole\0".as_ptr())))
+            },
+            close_pseudo_console : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("ClosePseudoConsole\0".as_ptr())))
+            },
+            resize_pseudo_console : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("ResizePseudoConsole\0".as_ptr())))
+            } ,
+            free_console : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("FreeConsole\0".as_ptr())))
+            },
+            get_console_mode : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("GetConsoleMode\0".as_ptr())))
+            },
+            set_console_mode : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("SetConsoleMode\0".as_ptr())))
+            },
+            get_console_window : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("GetConsoleWindow\0".as_ptr())))
+            },
+            set_std_handle : unsafe {
+                std::mem::transmute(GetProcAddress(kernal_32, PCSTR("SetStdHandle\0".as_ptr())))
+            },
+        }
+    };
+}
+
+struct ConsoleOpt {
+    alloc_console: Option<unsafe extern "system" fn() -> BOOL>,
+    create_pseudo_console:
+        Option<unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> HRESULT>,
+    close_pseudo_console: Option<unsafe extern "system" fn(HPCON)>,
+    resize_pseudo_console: Option<unsafe extern "system" fn(HPCON, COORD) -> HRESULT>,
+    free_console: Option<unsafe extern "system" fn() -> BOOL>,
+    get_console_mode: Option<unsafe extern "system" fn(HANDLE, *mut CONSOLE_MODE) -> BOOL>,
+    set_console_mode: Option<unsafe extern "system" fn(HANDLE, CONSOLE_MODE) -> BOOL>,
+    get_console_window: Option<unsafe extern "system" fn() -> HWND>,
+    set_std_handle: Option<unsafe extern "system" fn(STD_HANDLE, HANDLE) -> BOOL>,
+}
+
+impl ConsoleOpt {
+    pub fn any_none(&self) -> bool {
+        self.alloc_console.is_none()
+            || self.create_pseudo_console.is_none()
+            || self.close_pseudo_console.is_none()
+            || self.resize_pseudo_console.is_none()
+            || self.free_console.is_none()
+            || self.get_console_mode.is_none()
+            || self.set_console_mode.is_none()
+            || self.get_console_window.is_none()
+            || self.set_std_handle.is_none()
+    }
+}
 
 /// Struct that contains the required information to spawn a console
 /// using the Windows API `CreatePseudoConsole` call.
@@ -39,7 +97,7 @@ pub struct ConPTY {
     process_info: PROCESS_INFORMATION,
     startup_info: STARTUPINFOEXW,
     process: PTYProcess,
-    console_allocated: bool
+    console_allocated: bool,
 }
 
 unsafe impl Send for ConPTY {}
@@ -47,10 +105,24 @@ unsafe impl Sync for ConPTY {}
 
 impl PTYImpl for ConPTY {
     fn new(args: &PTYArgs) -> Result<Box<dyn PTYImpl>, OsString> {
+        if CONSOLE_OPT.any_none() {
+            return Err(OsString::from(
+                "ConPTY is not supported on this version of Windows.",
+            ));
+        }
+        let AllocConsole = CONSOLE_OPT.alloc_console.unwrap();
+        let CreatePseudoConsole = CONSOLE_OPT.create_pseudo_console.unwrap();
+        let SetConsoleMode = CONSOLE_OPT.set_console_mode.unwrap();
+        let GetConsoleMode = CONSOLE_OPT.get_console_mode.unwrap();
+        let GetConsoleWindow = CONSOLE_OPT.get_console_window.unwrap();
+        let SetStdHandle = CONSOLE_OPT.set_std_handle.unwrap();
+
         let mut result: HRESULT;
         if args.cols <= 0 || args.rows <= 0 {
             let err: OsString = OsString::from(format!(
-                "PTY cols and rows must be positive and non-zero. Got: ({}, {})", args.cols, args.rows));
+                "PTY cols and rows must be positive and non-zero. Got: ({}, {})",
+                args.cols, args.rows
+            ));
             return Err(err);
         }
 
@@ -68,9 +140,14 @@ impl PTYImpl for ConPTY {
             let conout_pwstr = PCWSTR(conout_vec.as_ptr());
 
             let h_console_res = CreateFileW(
-                conout_pwstr, (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
+                conout_pwstr,
+                (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, HANDLE(std::ptr::null_mut()));
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                HANDLE(0),
+            );
 
             if let Err(err) = h_console_res {
                 let result_msg = err.message();
@@ -87,9 +164,12 @@ impl PTYImpl for ConPTY {
             let h_in_res = CreateFileW(
                 conin_pwstr,
                 (FILE_GENERIC_READ | FILE_GENERIC_WRITE).0,
-                FILE_SHARE_READ, None,
-                OPEN_EXISTING, FILE_FLAGS_AND_ATTRIBUTES(0),
-                HANDLE(std::ptr::null_mut()));
+                FILE_SHARE_READ,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                HANDLE(0),
+            );
 
             if let Err(err) = h_in_res {
                 let result_msg = err.message();
@@ -102,12 +182,11 @@ impl PTYImpl for ConPTY {
             let mut console_mode_un = MaybeUninit::<CONSOLE_MODE>::uninit();
             let console_mode_ref = console_mode_un.as_mut_ptr();
 
-            result =
-                if GetConsoleMode(h_console, console_mode_ref.as_mut().unwrap()).is_ok() {
-                    S_OK
-                } else {
-                    Error::from_win32().into()
-                };
+            result = if GetConsoleMode(h_console, console_mode_ref.as_mut().unwrap()).as_bool() {
+                S_OK
+            } else {
+                Error::from_win32().into()
+            };
 
             if result.is_err() {
                 let result_msg = result.message();
@@ -118,12 +197,13 @@ impl PTYImpl for ConPTY {
             let console_mode = console_mode_un.assume_init();
 
             // Enable stream to accept VT100 input sequences
-            result =
-                if SetConsoleMode(h_console, console_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING).is_ok() {
-                    S_OK
-                } else {
-                    Error::from_win32().into()
-                };
+            result = if SetConsoleMode(h_console, console_mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+                .as_bool()
+            {
+                S_OK
+            } else {
+                Error::from_win32().into()
+            };
 
             if result.is_err() {
                 let result_msg = result.message();
@@ -132,7 +212,11 @@ impl PTYImpl for ConPTY {
             }
 
             // Set new streams
-            result = if SetStdHandle(STD_OUTPUT_HANDLE, h_console).is_ok() {S_OK} else {Error::from_win32().into()};
+            result = if SetStdHandle(STD_OUTPUT_HANDLE, h_console).as_bool() {
+                S_OK
+            } else {
+                Error::from_win32().into()
+            };
 
             if result.is_err() {
                 let result_msg = result.message();
@@ -140,7 +224,11 @@ impl PTYImpl for ConPTY {
                 return Err(string);
             }
 
-            result = if SetStdHandle(STD_ERROR_HANDLE, h_console).is_ok() {S_OK} else {Error::from_win32().into()};
+            result = if SetStdHandle(STD_ERROR_HANDLE, h_console).as_bool() {
+                S_OK
+            } else {
+                Error::from_win32().into()
+            };
 
             if result.is_err() {
                 let result_msg = result.message();
@@ -148,7 +236,11 @@ impl PTYImpl for ConPTY {
                 return Err(string);
             }
 
-            result = if SetStdHandle(STD_INPUT_HANDLE, h_in).is_ok() {S_OK} else {Error::from_win32().into()};
+            result = if SetStdHandle(STD_INPUT_HANDLE, h_in).as_bool() {
+                S_OK
+            } else {
+                Error::from_win32().into()
+            };
             if result.is_err() {
                 let result_msg = result.message();
                 let string = OsString::from(result_msg);
@@ -165,7 +257,10 @@ impl PTYImpl for ConPTY {
             let mut input_write_side = INVALID_HANDLE_VALUE;
 
             // Setup PTY size
-            let size = COORD {X: args.cols as i16, Y: args.rows as i16};
+            let size = COORD {
+                X: args.cols as i16,
+                Y: args.rows as i16,
+            };
 
             if !CreatePipe(&mut input_read_side, &mut input_write_side, None, 0).is_ok() {
                 result = Error::from_win32().into();
@@ -181,32 +276,45 @@ impl PTYImpl for ConPTY {
                 return Err(string);
             }
 
-            let pty_handle =
-                match CreatePseudoConsole(size, input_read_side, output_write_side, 0) {
-                    Ok(pty) => pty,
-                    Err(err) => {
-                        let result_msg = err.message();
-                        let string = OsString::from(result_msg);
-                        return Err(string);
-                    }
-                };
+            let mut pty_handle = HPCON::default();
+            if let Err(e) = CreatePseudoConsole(
+                size,
+                input_read_side,
+                output_write_side,
+                0,
+                &mut pty_handle as *mut HPCON,
+            )
+            .ok()
+            {
+                let result_msg = e.message();
+                let err_msg: &[u16] = result_msg.as_wide();
+                let string = OsString::from_wide(err_msg);
+                return Err(string);
+            }
 
             let _ = CloseHandle(input_read_side);
             let _ = CloseHandle(output_write_side);
 
-            let pty_process = PTYProcess::new(input_write_side.into(), output_read_side.into(), true);
+            let pty_process =
+                PTYProcess::new(input_write_side.into(), output_read_side.into(), true);
 
             Ok(Box::new(ConPTY {
                 handle: pty_handle,
                 process_info: PROCESS_INFORMATION::default(),
                 startup_info: STARTUPINFOEXW::default(),
                 process: pty_process,
-                console_allocated
+                console_allocated,
             }) as Box<dyn PTYImpl>)
         }
     }
 
-    fn spawn(&mut self, appname: OsString, cmdline: Option<OsString>, cwd: Option<OsString>, env: Option<OsString>) -> Result<bool, OsString> {
+    fn spawn(
+        &mut self,
+        appname: OsString,
+        cmdline: Option<OsString>,
+        cwd: Option<OsString>,
+        env: Option<OsString>,
+    ) -> Result<bool, OsString> {
         let result: HRESULT;
         let mut environ: *const u16 = ptr::null();
         let mut working_dir: *const u16 = ptr::null_mut();
@@ -243,15 +351,18 @@ impl PTYImpl for ConPTY {
             // Discover the size required for the list
             let mut required_bytes_u = MaybeUninit::<usize>::uninit();
             let required_bytes_ptr = required_bytes_u.as_mut_ptr();
-            let _ = InitializeProcThreadAttributeList(
-                LPPROC_THREAD_ATTRIBUTE_LIST(ptr::null_mut()), 1, 0,
-                required_bytes_ptr.as_mut().unwrap());
+            InitializeProcThreadAttributeList(
+                LPPROC_THREAD_ATTRIBUTE_LIST(ptr::null_mut()),
+                1,
+                0,
+                required_bytes_ptr.as_mut().unwrap(),
+            );
 
             // Allocate memory to represent the list
             let mut required_bytes = required_bytes_u.assume_init();
             let mut lp_attribute_list: Box<[u8]> = vec![0; required_bytes].into_boxed_slice();
-            let proc_thread_list: LPPROC_THREAD_ATTRIBUTE_LIST = LPPROC_THREAD_ATTRIBUTE_LIST(
-                lp_attribute_list.as_mut_ptr().cast::<_>());
+            let proc_thread_list: LPPROC_THREAD_ATTRIBUTE_LIST =
+                LPPROC_THREAD_ATTRIBUTE_LIST(lp_attribute_list.as_mut_ptr().cast::<_>());
 
             // Prepare Startup Information structure
             let start_info = STARTUPINFOEXW {
@@ -263,7 +374,14 @@ impl PTYImpl for ConPTY {
             };
 
             // Initialize the list memory location
-            if !InitializeProcThreadAttributeList(start_info.lpAttributeList, 1, 0, &mut required_bytes).is_ok() {
+            if !InitializeProcThreadAttributeList(
+                start_info.lpAttributeList,
+                1,
+                0,
+                &mut required_bytes,
+            )
+            .as_bool()
+            {
                 result = Error::from_win32().into();
                 let result_msg = result.message();
                 let string = OsString::from(result_msg);
@@ -272,9 +390,16 @@ impl PTYImpl for ConPTY {
 
             // Set the pseudoconsole information into the list
             if !UpdateProcThreadAttribute(
-                    start_info.lpAttributeList, 0, 0x00020016,
-                    Some(self.handle.0 as _), mem::size_of::<HPCON>(),
-                    None, None).is_ok() {
+                start_info.lpAttributeList,
+                0,
+                0x00020016,
+                Some(self.handle.0 as _),
+                mem::size_of::<HPCON>(),
+                None,
+                None,
+            )
+            .as_bool()
+            {
                 result = Error::from_win32().into();
                 let result_msg = result.message();
                 let string = OsString::from(result_msg);
@@ -296,8 +421,9 @@ impl PTYImpl for ConPTY {
                 Some(environ as _),
                 PCWSTR(working_dir),
                 si_w_ptr.as_ref().unwrap(),
-                &mut self.process_info
-            ).is_ok();
+                &mut self.process_info,
+            )
+            .as_bool();
 
             if !succ {
                 result = Error::from_win32().into();
@@ -312,15 +438,26 @@ impl PTYImpl for ConPTY {
     }
 
     fn set_size(&self, cols: i32, rows: i32) -> Result<(), OsString> {
+        if CONSOLE_OPT.any_none() {
+            return Err(OsString::from(
+                "ConPTY is not supported on this version of Windows.",
+            ));
+        }
+        let ResizePseudoConsole = CONSOLE_OPT.resize_pseudo_console.unwrap();
         if cols <= 0 || rows <= 0 {
             let err: OsString = OsString::from(format!(
-                "PTY cols and rows must be positive and non-zero. Got: ({}, {})", cols, rows));
+                "PTY cols and rows must be positive and non-zero. Got: ({}, {})",
+                cols, rows
+            ));
             return Err(err);
         }
 
-        let size = COORD {X: cols as i16, Y: rows as i16};
+        let size = COORD {
+            X: cols as i16,
+            Y: rows as i16,
+        };
         unsafe {
-            match ResizePseudoConsole(self.handle, size) {
+            match ResizePseudoConsole(self.handle, size).ok() {
                 Ok(_) => Ok(()),
                 Err(err) => {
                     let result_msg = err.message();
@@ -358,11 +495,24 @@ impl PTYImpl for ConPTY {
     fn get_fd(&self) -> isize {
         self.process.get_fd()
     }
+
+    fn get_conin_fd(&self) -> isize {
+        self.process.get_conin_fd()
+    }
+
+    fn get_conout_fd(&self) -> isize {
+        self.process.get_conout_fd()
+    }
 }
 
 impl Drop for ConPTY {
     fn drop(&mut self) {
-       unsafe {
+        unsafe {
+            if CONSOLE_OPT.any_none() {
+                return;
+            }
+            let ClosePseudoConsole = CONSOLE_OPT.close_pseudo_console.unwrap();
+            let FreeConsole = CONSOLE_OPT.free_console.unwrap();
             if !self.process_info.hThread.is_invalid() {
                 let _ = CloseHandle(self.process_info.hThread);
             }
@@ -372,7 +522,10 @@ impl Drop for ConPTY {
             }
 
             DeleteProcThreadAttributeList(self.startup_info.lpAttributeList);
-            ClosePseudoConsole(self.handle);
+
+            if !self.handle.is_invalid() {
+                ClosePseudoConsole(self.handle);
+            }
 
             if self.console_allocated {
                 let _ = FreeConsole();
